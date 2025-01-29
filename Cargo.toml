@@ -1,0 +1,15 @@
+[package]
+name = "smakcr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/julibeg/smakcr"
+readme = "README.md"
+keywords = ["k-mer", "counting", "bioinformatics", "sequencing"]
+categories = ["bioinformatics"]
+
+[dependencies]
+clap = "4.5.20"
+bio = "2.0.3"
+anyhow = "1.0.93"
+niffler = "2.6.0"
