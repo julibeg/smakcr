@@ -1,0 +1,8 @@
+- why is writing for k>9 currently so slow?
+- implement with hashmap for k > 9
+  - benchmark for ks up to 13 or so and see where the break-even point is
+- benchmark against
+  - jellyfish
+  - krust
+  - kmc3
+- TESTS TESTS TESTS
