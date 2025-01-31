@@ -25,16 +25,24 @@ fn initialize_stuff(k: usize) -> ([usize; 256], usize, Vec<u32>) {
 fn index_to_kmer(index: usize, k: usize) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut idx = index;
-    let mut kmer = Vec::with_capacity(k);
-    for _ in 0..k {
+    let mut kmer = vec![b'N'; k];
+    for i in 0..k {
         // extract the last two bits
         let base = bases[idx & 3];
-        kmer.push(base);
+        kmer[i] = base;
         idx >>= 2;
     }
     // we still need to reverse to get the correct order
     kmer.reverse();
     kmer
+}
+
+fn kmer_to_index(kmer: &Vec<u8>, key_map: [usize; 256]) -> usize {
+    let mut idx = 0;
+    for b in kmer {
+        idx = (idx << 2) + key_map[*b as usize];
+    }
+    idx
 }
 
 fn count_kmers_in_sequence(
@@ -91,6 +99,7 @@ fn write_results(
     out_fname: &String,
     counts: &[u32],
     k: usize,
+    key_map: [usize; 256],
     canonical: bool,
     delimiter: char,
 ) -> Result<()> {
@@ -123,13 +132,16 @@ fn write_results(
                     "{}{}{}",
                     std::str::from_utf8(&kmer)?,
                     delimiter,
-                    count
+                    count + counts[kmer_to_index(&revcomp, key_map)]
                 )?;
             }
         }
     } else {
         // write all kmers and their counts
         for (index, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            };
             let kmer = index_to_kmer(index, k);
             writeln!(
                 outfile,
@@ -213,14 +225,20 @@ fn main() -> Result<()> {
         "only DNA sequences are supported for now"
     );
 
+    let mut start = std::time::Instant::now();
     // key map for converting 'ACGT' to 0, 1, 2, 3
     let (key_map, mask, mut counts) = initialize_stuff(k);
+    println!("done initializing in {:?}", start.elapsed());
 
+    start = std::time::Instant::now();
     count_kmers_in_all_files(&input_files, k, &mut counts, mask, key_map)?;
+    println!("done counting in {:?}", start.elapsed());
 
+    start = std::time::Instant::now();
     // write output (perform the reverse operation (going from index to kmer) for all indices and
     // print the non-zero counts)
-    write_results(out_fname, &counts, k, canonical, delimiter)?;
+    write_results(out_fname, &counts, k, key_map, canonical, delimiter)?;
+    println!("done writing in {:?}", start.elapsed());
     Ok(())
 }
 

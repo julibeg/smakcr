@@ -13,6 +13,3 @@ clap = "4.5.20"
 bio = "2.0.3"
 anyhow = "1.0.93"
 niffler = "2.6.0"
-
-[profile.release]
-debug = true
