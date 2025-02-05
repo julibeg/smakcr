@@ -2,7 +2,7 @@ use anyhow::Result;
 use bio::alphabets::dna;
 use std::{fs::File, io::Write, vec};
 
-use clap::{builder::PossibleValue, value_parser, Arg, ArgAction, Command};
+use clap::{value_parser, Arg, ArgAction, Command};
 use smakcr::read_fasta;
 
 fn initialize_stuff(k: usize) -> ([usize; 256], usize, Vec<u32>) {
@@ -189,19 +189,6 @@ fn main() -> Result<()> {
                 .help("Output statistics in a tab-separated format"),
         )
         .arg(
-            Arg::new("TYPE")
-                .short('T')
-                .long("type")
-                .required(false)
-                .default_value("dna")
-                .value_parser([
-                    PossibleValue::new("dna"),
-                    PossibleValue::new("rna"),
-                    PossibleValue::new("protein"),
-                ])
-                .help("Sequence type"),
-        )
-        .arg(
             Arg::new("SIZE")
                 .short('k')
                 .required(false)
@@ -223,12 +210,7 @@ fn main() -> Result<()> {
     let out_fname = matches.get_one::<String>("TXT").unwrap();
     let delimiter: char = if matches.get_flag("TAB") { '\t' } else { ' ' };
     let k: usize = *matches.get_one("SIZE").unwrap();
-    let seq_type = matches.get_one::<String>("TYPE").unwrap().as_str();
     let canonical = matches.get_flag("CANONICAL");
-    assert!(
-        seq_type == "dna",
-        "only DNA sequences are supported for now"
-    );
 
     // key map for converting 'ACGT' to 0, 1, 2, 3
     let (key_map, mask, mut counts) = initialize_stuff(k);
