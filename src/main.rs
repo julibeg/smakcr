@@ -6,6 +6,7 @@ use clap::{builder::PossibleValue, value_parser, Arg, ArgAction, Command};
 use smakcr::read_fasta;
 
 fn initialize_stuff(k: usize) -> ([usize; 256], usize, Vec<u32>) {
+    measure_time::info_time!("initialize");
     // key map for converting 'ACGT' to 0, 1, 2, 3 (same for lowercase bases)
     let mut key_map = [usize::MAX; 256];
     for bases in [b"ACGT", b"acgt"].iter() {
@@ -86,6 +87,7 @@ fn count_kmers_in_all_files(
     mask: usize,
     key_map: [usize; 256],
 ) -> Result<()> {
+    measure_time::info_time!("count");
     for fasta_fn in input_files {
         for record in read_fasta(fasta_fn)? {
             // count kmers in sequence and handle unknown base error
@@ -103,6 +105,7 @@ fn write_results(
     canonical: bool,
     delimiter: char,
 ) -> Result<()> {
+    measure_time::info_time!("write results");
     // create output file
     let mut outfile = File::create(out_fname)?;
 
@@ -156,6 +159,8 @@ fn write_results(
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+    measure_time::info_time!("total");
     let version = env!("CARGO_PKG_VERSION");
     let matches = Command::new("faSize")
         .version(version)
@@ -225,20 +230,14 @@ fn main() -> Result<()> {
         "only DNA sequences are supported for now"
     );
 
-    let mut start = std::time::Instant::now();
     // key map for converting 'ACGT' to 0, 1, 2, 3
     let (key_map, mask, mut counts) = initialize_stuff(k);
-    println!("done initializing in {:?}", start.elapsed());
 
-    start = std::time::Instant::now();
     count_kmers_in_all_files(&input_files, k, &mut counts, mask, key_map)?;
-    println!("done counting in {:?}", start.elapsed());
 
-    start = std::time::Instant::now();
     // write output (perform the reverse operation (going from index to kmer) for all indices and
     // print the non-zero counts)
     write_results(out_fname, &counts, k, key_map, canonical, delimiter)?;
-    println!("done writing in {:?}", start.elapsed());
     Ok(())
 }
 
