@@ -27,10 +27,9 @@ fn index_to_kmer(index: usize, k: usize) -> Vec<u8> {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut idx = index;
     let mut kmer = vec![b'N'; k];
-    for i in 0..k {
+    for item in kmer.iter_mut() {
         // extract the last two bits
-        let base = bases[idx & 3];
-        kmer[i] = base;
+        *item = bases[idx & 3];
         idx >>= 2;
     }
     // we still need to reverse to get the correct order
@@ -98,16 +97,21 @@ fn count_kmers_in_all_files(
 }
 
 fn write_results(
-    out_fname: &String,
+    outfile: Option<&String>,
     counts: &[u32],
     k: usize,
     key_map: [usize; 256],
     canonical: bool,
-    delimiter: char,
+    non_zero: bool,
 ) -> Result<()> {
     measure_time::info_time!("write results");
-    // create output file
-    let mut outfile = File::create(out_fname)?;
+    // create output file or write to STDOUT
+    let out: Box<dyn Write> = match outfile {
+        Some(outfile) => Box::new(File::create(outfile)?),
+        None => Box::new(std::io::stdout()),
+    };
+
+    let mut out_writer = std::io::BufWriter::new(out);
 
     if canonical {
         // look up the reverse complement of the kmer and print the smaller of the two (alongside
@@ -117,42 +121,34 @@ fn write_results(
             // TODO: implement a way to get the index of the reverse complement directly
             let revcomp = dna::revcomp(&kmer);
             // only write if this kmer is canonical (i.e. smaller than the reverse complement)
-            if kmer == revcomp {
-                // palindrome
-                writeln!(
-                    outfile,
-                    "{}{}{}",
-                    std::str::from_utf8(&kmer)?,
-                    delimiter,
-                    count
-                )?;
+            if kmer > revcomp {
                 continue;
             }
-            if kmer < revcomp {
+            // for a palindromic kmer (identical to the reverse complement), write the counts;
+            // otherwise, write the sum of both counts
+            let combined_count = if kmer == revcomp {
+                // kmer is palindrome
+                count
+            } else {
                 // kmer is smaller than its reverse complement
-                writeln!(
-                    outfile,
-                    "{}{}{}",
-                    std::str::from_utf8(&kmer)?,
-                    delimiter,
-                    count + counts[kmer_to_index(&revcomp, key_map)]
-                )?;
+                count + counts[kmer_to_index(&revcomp, key_map)]
+            };
+            if non_zero && combined_count == 0 {
+                continue;
             }
+            out_writer.write_all(
+                format!("{}\t{}\n", std::str::from_utf8(&kmer)?, combined_count).as_bytes(),
+            )?;
         }
     } else {
         // write all kmers and their counts
         for (index, &count) in counts.iter().enumerate() {
-            if count == 0 {
+            if non_zero && count == 0 {
                 continue;
             };
             let kmer = index_to_kmer(index, k);
-            writeln!(
-                outfile,
-                "{}{}{}",
-                std::str::from_utf8(&kmer)?,
-                delimiter,
-                count
-            )?;
+            out_writer
+                .write_all(format!("{}\t{}\n", std::str::from_utf8(&kmer)?, count).as_bytes())?;
         }
     }
     Ok(())
@@ -174,43 +170,40 @@ fn main() -> Result<()> {
                 .help("Input FASTA file(s)"),
         )
         .arg(
-            Arg::new("TXT")
-                .required(true)
-                .num_args(1)
-                .index(2)
-                .help("Output text file"),
-        )
-        .arg(
-            Arg::new("TAB")
-                .short('t')
-                .long("tab")
-                .required(false)
-                .action(ArgAction::SetTrue)
-                .help("Output statistics in a tab-separated format"),
-        )
-        .arg(
             Arg::new("SIZE")
+                .required(true)
                 .short('k')
-                .required(false)
                 .default_value("3")
                 .value_parser(value_parser!(usize))
                 .help("K-mer size"),
         )
         .arg(
+            Arg::new("OUT")
+                .short('o')
+                .long("output")
+                .help("Output file"),
+        )
+        .arg(
             Arg::new("CANONICAL")
                 .short('c')
                 .long("canonical")
-                .required(false)
                 .action(ArgAction::SetTrue)
                 .help("Output canonical k-mers"),
+        )
+        .arg(
+            Arg::new("NONZERO")
+                .short('n')
+                .long("non-zero")
+                .action(ArgAction::SetTrue)
+                .help("Output only non-zero counts"),
         )
         .get_matches();
 
     let input_files: Vec<_> = matches.get_many::<String>("FASTA").unwrap().collect();
-    let out_fname = matches.get_one::<String>("TXT").unwrap();
-    let delimiter: char = if matches.get_flag("TAB") { '\t' } else { ' ' };
     let k: usize = *matches.get_one("SIZE").unwrap();
+    let output = matches.get_one::<String>("OUT");
     let canonical = matches.get_flag("CANONICAL");
+    let non_zero = matches.get_flag("NONZERO");
 
     // key map for converting 'ACGT' to 0, 1, 2, 3
     let (key_map, mask, mut counts) = initialize_stuff(k);
@@ -219,7 +212,7 @@ fn main() -> Result<()> {
 
     // write output (perform the reverse operation (going from index to kmer) for all indices and
     // print the non-zero counts)
-    write_results(out_fname, &counts, k, key_map, canonical, delimiter)?;
+    write_results(output, &counts, k, key_map, canonical, non_zero)?;
     Ok(())
 }
 

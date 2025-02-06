@@ -8,9 +8,12 @@
   - krust
   - kmc3
 - more testing
+  - test larger files (e.g. 10kb) and compare with expected hash of counts file or similar
   - automate testing (with pre-commit or github actions)
 
 ## Longer term
 
+- add thread for decompression
+- add multi-threading
 - RNA and protein support
 - restructure so that library can be used in other projects
