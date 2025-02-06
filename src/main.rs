@@ -1,8 +1,13 @@
+use std::{
+    fs::File,
+    io::{stdout, BufWriter, Write},
+    str, vec,
+};
+
 use anyhow::Result;
 use bio::alphabets::dna;
-use std::{fs::File, io::Write, vec};
-
 use clap::{value_parser, Arg, ArgAction, Command};
+
 use smakcr::read_fasta;
 
 fn initialize_stuff(k: usize) -> ([usize; 256], usize, Vec<u32>) {
@@ -108,10 +113,10 @@ fn write_results(
     // create output file or write to STDOUT
     let out: Box<dyn Write> = match outfile {
         Some(outfile) => Box::new(File::create(outfile)?),
-        None => Box::new(std::io::stdout()),
+        None => Box::new(stdout()),
     };
 
-    let mut out_writer = std::io::BufWriter::new(out);
+    let mut out_writer = BufWriter::new(out);
 
     if canonical {
         // look up the reverse complement of the kmer and print the smaller of the two (alongside
@@ -137,7 +142,7 @@ fn write_results(
                 continue;
             }
             out_writer.write_all(
-                format!("{}\t{}\n", std::str::from_utf8(&kmer)?, combined_count).as_bytes(),
+                format!("{}\t{}\n", str::from_utf8(&kmer)?, combined_count).as_bytes(),
             )?;
         }
     } else {
@@ -147,8 +152,7 @@ fn write_results(
                 continue;
             };
             let kmer = index_to_kmer(index, k);
-            out_writer
-                .write_all(format!("{}\t{}\n", std::str::from_utf8(&kmer)?, count).as_bytes())?;
+            out_writer.write_all(format!("{}\t{}\n", str::from_utf8(&kmer)?, count).as_bytes())?;
         }
     }
     Ok(())
