@@ -1,6 +1,7 @@
 ## Short term
 
 - why is writing for k>9 currently so slow?
+  - we need better handling of canonical kmers
 - implement with hashmap for k > 9
   - benchmark for ks up to 13 or so and see where the break-even point is
 - benchmark against
