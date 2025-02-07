@@ -245,6 +245,9 @@ mod tests {
         assert_eq!(counts[cga_index], 1);
         assert_eq!(counts[gaa_index], 1);
         assert_eq!(counts[aaa_index], 2);
+
+        // make sure all other counts are 0
+        assert_eq!(counts.iter().sum::<u32>(), 9);
     }
 
     #[test]
@@ -255,9 +258,44 @@ mod tests {
         assert!(counts.iter().all(|&count| count == 0));
     }
 
+    #[test]
+    fn test_index_to_kmer() {
+        let k = 3;
+        let kmer = index_to_kmer(0b00_01_10, k);
+        assert_eq!(kmer, b"ACG");
+
+        let acg_index = 0b00_01_10; // ACG
+        let cgt_index = 0b01_10_11; // CGT
+        let gta_index = 0b10_11_00; // GTA
+        let tac_index = 0b11_00_01; // TAC
+        let cga_index = 0b01_10_00; // CGA
+        let gaa_index = 0b10_00_00; // GAA
+        let aaa_index = 0b00_00_00; // AAA
+
+        assert_eq!(index_to_kmer(acg_index, k), b"ACG");
+        assert_eq!(index_to_kmer(cgt_index, k), b"CGT");
+        assert_eq!(index_to_kmer(gta_index, k), b"GTA");
+        assert_eq!(index_to_kmer(tac_index, k), b"TAC");
+        assert_eq!(index_to_kmer(cga_index, k), b"CGA");
+        assert_eq!(index_to_kmer(gaa_index, k), b"GAA");
+        assert_eq!(index_to_kmer(aaa_index, k), b"AAA");
+    }
+
+    #[test]
+    fn test_unknwn_bases() {
+        let k = 3;
+        let (key_map, mask, mut counts) = initialize_stuff(k);
+        count_kmers_in_sequence(b"AaAxcGtx", k, &mut counts, mask, key_map);
+
+        let aaa_index = 0b00_00_00; // AAA
+        let cgt_index = 0b01_10_11; // CGT
+        assert_eq!(counts[aaa_index], 1);
+        assert_eq!(counts[cgt_index], 1);
+        // make sure all other counts are 0
+        assert_eq!(counts.iter().sum::<u32>(), 2);
+    }
+
     // TODO: add tests for
-    // - `index_to_kmer`
-    // - ignoring of unknown bases
     // - the whole program (i.e. against an existing file to make sure the output format etc is as
     //   expected)
 }
