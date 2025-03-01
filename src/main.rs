@@ -107,7 +107,7 @@ fn write_results(
     k: usize,
     key_map: [usize; 256],
     canonical: bool,
-    non_zero: bool,
+    write_zeros: bool,
 ) -> Result<()> {
     measure_time::info_time!("write results");
     // create output file or write to STDOUT
@@ -138,7 +138,7 @@ fn write_results(
                 // kmer is smaller than its reverse complement
                 count + counts[kmer_to_index(&revcomp, key_map)]
             };
-            if non_zero && combined_count == 0 {
+            if combined_count == 0 && !write_zeros {
                 continue;
             }
             out_writer.write_all(
@@ -148,7 +148,7 @@ fn write_results(
     } else {
         // write all kmers and their counts
         for (index, &count) in counts.iter().enumerate() {
-            if non_zero && count == 0 {
+            if count == 0 && !write_zeros {
                 continue;
             };
             let kmer = index_to_kmer(index, k);
@@ -195,11 +195,11 @@ fn main() -> Result<()> {
                 .help("Output canonical k-mers"),
         )
         .arg(
-            Arg::new("NONZERO")
-                .short('n')
-                .long("non-zero")
+            Arg::new("ZERO")
+                .short('z')
+                .long("zero-counts")
                 .action(ArgAction::SetTrue)
-                .help("Output only non-zero counts"),
+                .help("Also output k-mers with zero counts"),
         )
         .get_matches();
 
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
     let k: usize = *matches.get_one("SIZE").unwrap();
     let output = matches.get_one::<String>("OUT");
     let canonical = matches.get_flag("CANONICAL");
-    let non_zero = matches.get_flag("NONZERO");
+    let write_zeros = matches.get_flag("ZERO");
 
     // key map for converting 'ACGT' to 0, 1, 2, 3
     let (key_map, mask, mut counts) = initialize_stuff(k);
@@ -216,7 +216,7 @@ fn main() -> Result<()> {
 
     // write output (perform the reverse operation (going from index to kmer) for all indices and
     // print the non-zero counts)
-    write_results(output, &counts, k, key_map, canonical, non_zero)?;
+    write_results(output, &counts, k, key_map, canonical, write_zeros)?;
     Ok(())
 }
 
