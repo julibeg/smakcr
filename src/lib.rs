@@ -37,4 +37,3 @@ pub fn read_fasta<P: AsRef<Path> + Display>(
 
     Ok(records)
 }
-// let record = record.context(format!("Failed parsing FASTA file \"{}\"", fasta_fn))?;
