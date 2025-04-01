@@ -99,7 +99,7 @@ impl FastxReader {
             b'@' => FastxReader::Fastq(fastq::Reader::new(Box::new(buf_reader))),
             _ => {
                 return Err(anyhow::anyhow!(
-                    "Invalid FASTx file format (first byte is {} and neither '>' nor '@'",
+                    "Invalid FASTx file format (first byte is '{}' and neither '>' nor '@'",
                     first_byte as char
                 ));
             }
