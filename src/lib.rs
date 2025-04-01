@@ -19,12 +19,12 @@ type PerThreadVec<T> = Arc<Vec<Mutex<Vec<T>>>>;
 pub const KEY_MAP: [usize; 256] = {
     let mut key_map = [usize::MAX; 256];
     key_map[b'A' as usize] = 0;
-    key_map[b'C' as usize] = 1;
-    key_map[b'G' as usize] = 2;
-    key_map[b'T' as usize] = 3;
     key_map[b'a' as usize] = 0;
+    key_map[b'C' as usize] = 1;
     key_map[b'c' as usize] = 1;
+    key_map[b'G' as usize] = 2;
     key_map[b'g' as usize] = 2;
+    key_map[b'T' as usize] = 3;
     key_map[b't' as usize] = 3;
     key_map
 };
@@ -66,10 +66,10 @@ pub fn index_to_kmer(index: usize, k: usize) -> Vec<u8> {
     kmer
 }
 
-pub fn kmer_to_index(kmer: &[u8], key_map: [usize; 256]) -> usize {
+pub fn kmer_to_index(kmer: &[u8]) -> usize {
     let mut idx = 0;
     for b in kmer {
-        idx = (idx << 2) + key_map[*b as usize];
+        idx = (idx << 2) + KEY_MAP[*b as usize];
     }
     idx
 }
@@ -239,7 +239,7 @@ impl KmerCounter {
                     count
                 } else {
                     // kmer is smaller than its reverse complement
-                    count + counts[kmer_to_index(&revcomp, KEY_MAP)]
+                    count + counts[kmer_to_index(&revcomp)]
                 };
                 if combined_count == 0 && !write_zeros {
                     continue;
