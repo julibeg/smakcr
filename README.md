@@ -1,4 +1,4 @@
-# SmaKCR
+# smakcr
 **Sma**ll **K**-mer **C**ounting with **R**ust.
 
 Most k-mer counters are optimized for large k.
