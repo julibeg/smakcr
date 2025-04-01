@@ -66,7 +66,7 @@ pub fn index_to_kmer(index: usize, k: usize) -> Vec<u8> {
     kmer
 }
 
-pub fn kmer_to_index(kmer: &Vec<u8>, key_map: [usize; 256]) -> usize {
+pub fn kmer_to_index(kmer: &[u8], key_map: [usize; 256]) -> usize {
     let mut idx = 0;
     for b in kmer {
         idx = (idx << 2) + key_map[*b as usize];
