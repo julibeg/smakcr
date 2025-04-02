@@ -57,7 +57,7 @@ pub fn get_compression_agnostic_reader<P: AsRef<Path> + Display>(
         Err(niffler::Error::FileTooShort) => {
             Ok(Box::new(BufReader::new(File::open(&path)?)) as Box<dyn Read + Send>)
         }
-        Err(e) => Err(e).context(format!("Failed reading FASTA file \"{}\"", path)),
+        Err(e) => Err(e).context(format!("Failed reading file \"{}\"", path)),
     }?;
 
     Ok(reader)
@@ -356,8 +356,8 @@ impl std::ops::Add<KmerCounter> for KmerCounter {
 /// `seq_io::fastq::RefRecord`.
 ///
 /// The trait enforces a method for checking if a `RefRecord`'s sequence is long enough to contain a
-/// k-mer and for iteratively process each base with some function. This avoids code duplication in
-/// the `CountKmers` implementation for the two different record types.
+/// k-mer and for iteratively process each base with a closure. This avoids code duplication in the
+/// `CountKmers` implementation for the two different record types.
 trait PerBaseRefRecord {
     /// Checks if the sequence record is potentially too short to contain any k-mers of length `k`.
     ///
@@ -367,33 +367,35 @@ trait PerBaseRefRecord {
 
     /// Iterates over each base in the sequence record, applying the provided closure `f`.
     ///
-    /// This abstracts away the details of how sequence data is stored or accessed
-    /// within different record types (e.g., handling line breaks in FASTA).
+    /// This abstracts away the details of how sequence data is stored or accessed within different
+    /// record types (e.g., handling line breaks in FASTA).
     fn for_each_base<F>(&self, f: F)
     where
         F: FnMut(u8);
 }
 
 impl PerBaseRefRecord for fasta::RefRecord<'_> {
-    /// Checks if the FASTA record is potentially too short for k-mers of length `k`.
+    /// Checks if the FASTA record is too short to contain a single k-mer.
     ///
     /// Considers potential newlines within the sequence data by checking `full_seq()`
     /// if the raw sequence length `seq().len()` seems borderline.
     fn too_short(&self, k: usize) -> bool {
-        // FASTA-specific length check
         if <Self as fasta::Record>::seq(self).len() < k * 2 {
-            // the sequence might be too short to contain a kmer. however, when checking we need to
+            // the sequence might be too short to contain a k-mer. however, when checking we need to
             // make sure to take newlines into account (at worst we could be dealing with a FASTA
             // file with just one base per line and then `full_seq()` would be half the length of
-            // `seq()`). note that we don't check `full_seq().len()` right away because
-            // `full_seq()` allocates a new vector and we want to avoid that unless we have to
+            // `seq()`). note that we don't check `full_seq().len()` right away because `full_seq()`
+            // allocates a new vector and we want to avoid that unless we have to
             self.full_seq().len() < k
         } else {
             false
         }
     }
 
-    /// Iterates over bases in a FASTA record, handling potential line breaks.
+    /// Iterates over bases in a FASTA record (ignoring newlines) and applies the provided closure.
+    ///
+    /// We could use `.full_seq()`, but this allocates. Instead, we iterate over the individual
+    /// lines in the FASTA record.
     fn for_each_base<F>(&self, mut f: F)
     where
         F: FnMut(u8),
@@ -407,7 +409,7 @@ impl PerBaseRefRecord for fasta::RefRecord<'_> {
 }
 
 impl PerBaseRefRecord for fastq::RefRecord<'_> {
-    /// Checks if the FASTQ record is too short for k-mers of length `k`.
+    /// Checks if the FASTA record is too short to contain a single k-mer.
     ///
     /// FASTQ sequences are contiguous, so this is a simple length check.
     fn too_short(&self, k: usize) -> bool {
@@ -415,7 +417,7 @@ impl PerBaseRefRecord for fastq::RefRecord<'_> {
         <Self as fastq::Record>::seq(self).len() < k
     }
 
-    /// Iterates over bases in a FASTQ record.
+    /// Iterates over bases in a FASTQ record (we don't need to worry about newlines here).
     fn for_each_base<F>(&self, mut f: F)
     where
         F: FnMut(u8),
@@ -428,9 +430,9 @@ impl PerBaseRefRecord for fastq::RefRecord<'_> {
 
 /// A trait defining the interface for k-mer counting operations.
 ///
-/// This trait allows different types (like individual sequence records or entire
-/// file readers) to implement their own k-mer counting logic, supporting both
-/// single-threaded and parallel execution.
+/// This trait allows different types (like individual sequence records or entire file readers) to
+/// implement their own k-mer counting logic, supporting both single-threaded and parallel
+/// execution.
 pub trait CountKmers {
     // NOTE: a simple way of allowing the trait on both mutable (`FastxReader`) and immutable
     // (`fast{a,q}::RefRecord`) data is to just pass `self` which consumes the object (as we're
@@ -439,19 +441,18 @@ pub trait CountKmers {
 
     /// Counts k-mers within the implementing type using a single thread.
     ///
-    /// Takes the k-mer length `k`, a mutable slice `counts` to store the results,
-    /// and the `mask` for rolling hash calculation. Updates the `counts` slice directly.
+    /// Takes the k-mer length, a mutable slice to store the results, and the mask for rolling index
+    /// calculation. Updates the `counts` slice directly.
     fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()>;
 
     /// Counts k-mers within the implementing type using multiple threads.
     ///
-    /// Takes the k-mer length `k`, a vector of thread-local count vectors `per_thread_counts`,
-    /// the `mask` for rolling hash calculation, and the number of threads `n_threads`.
-    /// Implementations should distribute the work across threads and update the
-    /// corresponding count vectors in `per_thread_counts`.
+    /// Takes the k-mer length, a vector of thread-local count vectors, the mask for rolling index
+    /// calculation, and the number of threads. Implementations should distribute the work across
+    /// threads and update the corresponding vectors in `per_thread_counts`.
     ///
-    /// Provides a default single-threaded implementation that delegates to `count_kmers`.
-    /// Types supporting parallelism should override this method.
+    /// Provides a default single-threaded implementation that delegates to `count_kmers`. Types
+    /// supporting parallelism should override this.
     fn count_kmers_parallel(
         self,
         k: usize,
@@ -462,8 +463,6 @@ pub trait CountKmers {
     where
         Self: Sized,
     {
-        // this provides a single-threaded blanket implementation; types that support parallel
-        // counting can override it
         self.count_kmers(k, per_thread_counts[0].lock().unwrap().as_mut(), mask)?;
 
         Ok(())
@@ -471,23 +470,23 @@ pub trait CountKmers {
 }
 
 impl<T: PerBaseRefRecord> CountKmers for T {
-    /// Implements single-threaded k-mer counting for types that provide base-level access
-    /// via the `PerBaseRefRecord` trait (e.g., `fasta::RefRecord`, `fastq::RefRecord`).
+    /// Implements single-threaded k-mer counting for types that provide base-level access via the
+    /// `PerBaseRefRecord` trait (`seq_io::fasta::RefRecord` and `seq_io::fastq::RefRecord`).
     ///
-    /// Iterates through the sequence bases, calculates the rolling k-mer index,
-    /// and increments the corresponding count in the `counts` slice. Handles invalid
-    /// bases ('N' or others not in `KEY_MAP`) by skipping affected k-mers.
+    /// Iterates through the sequence bases, calculates the rolling k-mer index, and increments the
+    /// corresponding count in the `counts` slice. Handles invalid bases ('N' or others) by skipping
+    /// affected k-mers.
     fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()>
     where
         Self: Sized,
     {
-        // we first check if the record is too short to contain a single k-mer
+        // first check if the record is too short to contain a single k-mer
         if self.too_short(k) {
             return Ok(());
         }
 
-        // keep a skip counter to avoid counting kmers with unknown bases (and the first few
-        // nucleotides that don't form a complete kmer)
+        // keep a skip counter to avoid counting k-mers with unknown bases (and the first few
+        // nucleotides that don't form a complete k-mer)
         let mut skip = k - 1;
         let mut idx = 0;
 
@@ -496,13 +495,13 @@ impl<T: PerBaseRefRecord> CountKmers for T {
             idx = (idx << 2) & mask;
             let add = KEY_MAP[b as usize];
             if add == usize::MAX {
-                // unknown base --> skip this kmer and the next `k - 1` kmers
+                // unknown base --> skip this k-mer and the next `k - 1` k-mers
                 skip = k - 1;
                 return;
             }
             idx += add;
             if skip == 0 {
-                // only count the kmer if not skipping
+                // only count the k-mer if not skipping
                 counts[idx] += 1;
             } else {
                 skip -= 1;
@@ -516,8 +515,8 @@ impl<T: PerBaseRefRecord> CountKmers for T {
 impl CountKmers for FastxReader {
     /// Implements single-threaded k-mer counting for a `FastxReader`.
     ///
-    /// Iterates through all records (FASTA or FASTQ) provided by the reader
-    /// and delegates the counting for each record to its `count_kmers` implementation.
+    /// Iterates through all records (FASTA or FASTQ) provided by the reader and delegates the
+    /// counting for each record to its own implementation.
     fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()> {
         match self {
             Self::Fasta(mut reader) => {
@@ -536,9 +535,9 @@ impl CountKmers for FastxReader {
 
     /// Implements parallel k-mer counting for a `FastxReader`.
     ///
-    /// Uses `seq_io::parallel::read_parallel` to read records concurrently and
-    /// distribute the counting task across multiple threads. Each thread updates
-    /// its assigned count vector within `per_thread_counts`.
+    /// Uses `seq_io::parallel::read_parallel` to read records concurrently and distribute the
+    /// counting across multiple threads. Each thread updates its assigned vector within
+    /// `per_thread_counts`.
     fn count_kmers_parallel(
         self,
         k: usize,
@@ -548,6 +547,8 @@ impl CountKmers for FastxReader {
     ) -> Result<()> {
         let queue_len = n_threads * 2;
 
+        // TODO: ideally we'd factor this out into `PerThreadVec` and have a method to get the lock
+        // of one of the vectors
         let record_set_counter = Arc::new(AtomicUsize::new(0));
 
         // the match arms below would only differ by the type of the `record_set` parameter, so we
@@ -574,7 +575,7 @@ impl CountKmers for FastxReader {
                         }
                     },
                     |record_sets| {
-                        // nothing to do, just error propagation
+                        // nothing to do in this closure, just error propagation
                         while let Some(result) = record_sets.next() {
                             result?;
                         }
@@ -601,8 +602,7 @@ impl CountKmers for FastxReader {
 mod tests {
     use super::*;
 
-    // NOTE: This impl is just for testing convenience, allowing &[u8] to be used
-    // where `PerBaseRefRecord` is expected in tests.
+    // this impl is just used for testing
     impl PerBaseRefRecord for &[u8] {
         fn too_short(&self, k: usize) -> bool {
             self.len() < k
@@ -618,10 +618,9 @@ mod tests {
         }
     }
 
-    // NOTE: Helper function for tests.
+    // helper function for tests.
     fn count_kmers_in_sequence(seq: &[u8], k: usize) -> Vec<usize> {
         let mut counter = KmerCounter::new(k, 1);
-        // NOTE: Using the test impl of `PerBaseRefRecord` for `&[u8]` here.
         counter.count(seq).unwrap();
         counter.into_vec().unwrap()
     }
@@ -655,9 +654,7 @@ mod tests {
 
     #[test]
     fn test_count_kmers_with_short_sequence() {
-        // TODO: this actually only tests the implementation for `&[u8]` and for the other types.
-        // the test would be more useful if we only used a default implementation of `count_kmers()`
-        // that relies on other functions (e.g. `too_short()` and `process_base()`)
+        // NOTE: this actually only tests the implementation for `&[u8]` and not for the other types
         let k = 5;
         let counts = count_kmers_in_sequence(b"ACG", k);
 
