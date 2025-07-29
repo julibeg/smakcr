@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 
     let counter = match (input_files.len(), n_threads) {
         (1, _) | (_, 1) => {
-            // either just one file or just one thread --> iterate over the files and process with
+            // either just one file or just one thread --> process the files sequentially with
             // `n_threads` threads at a time
             let mut counter = KmerCounter::new(k, n_threads);
 
