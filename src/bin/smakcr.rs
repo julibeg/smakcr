@@ -7,7 +7,7 @@ use smakcr::KmerCounter;
 
 fn main() -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
-    let matches = Command::new("faSize")
+    let matches = Command::new("smakcr")
         .version(version)
         .author("Andrea Talenti <andrea.talenti@ed.ac.uk>")
         .about("Print counts of K-mers of a given size across one or more FASTA files")

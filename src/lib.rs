@@ -227,8 +227,11 @@ impl KmerCounter {
                     let mut first_thread_counts = per_thread_counts[0].lock().unwrap();
                     for thread_count in per_thread_counts.iter().skip(1) {
                         let thread_count = thread_count.lock().unwrap();
-                        for (i, &count) in thread_count.iter().enumerate() {
-                            first_thread_counts[i] += count;
+                        for (first, &other) in first_thread_counts
+                            .iter_mut()
+                            .zip(thread_count.iter())
+                        {
+                            *first += other;
                         }
                     }
                 }
@@ -300,8 +303,7 @@ impl KmerCounter {
                 if combined_count == 0 && !write_zeros {
                     continue;
                 }
-                out_writer
-                    .write_all(format!("{}\t{}\n", from_utf8(&kmer)?, combined_count).as_bytes())?;
+                writeln!(out_writer, "{}\t{}", from_utf8(&kmer)?, combined_count)?;
             }
         } else {
             // also write non-canonical kmers
@@ -310,7 +312,7 @@ impl KmerCounter {
                     continue;
                 };
                 let kmer = index_to_kmer(index, k);
-                out_writer.write_all(format!("{}\t{}\n", from_utf8(&kmer)?, count).as_bytes())?;
+                writeln!(out_writer, "{}\t{}", from_utf8(&kmer)?, count)?;
             }
         }
         Ok(())
@@ -339,15 +341,20 @@ impl std::ops::Add<KmerCounter> for KmerCounter {
                     mask: _,
                 },
             ) => {
-                if (k != other_k) | (counts.len() != other_counts.len()) {
-                    return Err(anyhow!("Cannot add different types of `KmerCounter`"));
+                if k != other_k {
+                    return Err(anyhow!("Cannot add KmerCounters with different k values"));
                 }
-                for (i, &count) in other_counts.iter().enumerate() {
-                    counts[i] += count;
+                if counts.len() != other_counts.len() {
+                    return Err(anyhow!("Cannot add KmerCounters with different count lengths"));
+                }
+                for (left, &right) in counts.iter_mut().zip(other_counts.iter()) {
+                    *left += right;
                 }
                 Ok(KmerCounter::SingleThreaded { k, counts, mask })
             }
-            _ => Err(anyhow!("Cannot add different types of KmerCounters")),
+            _ => Err(anyhow!(
+                "Cannot add SingleThreaded and MultiThreaded KmerCounters"
+            )),
         }
     }
 }
@@ -375,7 +382,7 @@ trait PerBaseRefRecord {
 }
 
 impl PerBaseRefRecord for fasta::RefRecord<'_> {
-    /// Checks if the FASTA record is too short to contain a single k-mer.
+    /// Checks if the FASTQ record is too short to contain a single k-mer.
     ///
     /// Considers potential newlines within the sequence data by checking `full_seq()`
     /// if the raw sequence length `seq().len()` seems borderline.
@@ -476,10 +483,7 @@ impl<T: PerBaseRefRecord> CountKmers for T {
     /// Iterates through the sequence bases, calculates the rolling k-mer index, and increments the
     /// corresponding count in the `counts` slice. Handles invalid bases ('N' or others) by skipping
     /// affected k-mers.
-    fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()>
-    where
-        Self: Sized,
-    {
+    fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()> {
         // first check if the record is too short to contain a single k-mer
         if self.too_short(k) {
             return Ok(());
@@ -685,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknwn_bases() {
+    fn test_unknown_bases() {
         let k = 3;
         let counts = count_kmers_in_sequence(b"AaAxcGtx", k);
 
