@@ -1,0 +1,29 @@
+>seq1
+ACGTG
+>seq2 this is a 24bp seq
+AAACGGGTTG
+ACGTAACCAG
+TTGA
+>seq3 this is a 35bp seq
+AAAAAAAAAA
+AAAAAAAAAA
+AAAAAAAAAA
+AAAAA
+>seq4 this is a softmasked 10bp sequence
+AAAcccTtGg
+>seq5 this is a hardmasked 10bp sequence
+AAANNNNTTT
+>seq6.1 this is a mixed soft and hardmasked 10bp sequence
+AAANNNNttt
+>seq7.1.1 this contains non-canonical bases
+AA.NNNN--t
+>seq8 this contains non-canonical bases and softmasked Ns
+AA.NNnn--t
+>seq9 this contains non-canonical bases and softmasked Ns
+AA.NNnn..t
+>seq10 this contains non-canonical bases and softmasked Ns pt2
+AA-NNnn--
+>seq11 this contains non-canonical bases and softmasked Ns
+AA-NnUU--
+>seq12 example of an RNA sequence
+AACNNUUUGACUUC
