@@ -3,7 +3,6 @@ use std::{
     fs::File,
     io::{stdout, BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
-    str::from_utf8,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -11,7 +10,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Error, Result};
-use bio::alphabets::dna;
 use seq_io::{fasta, fastq, parallel};
 
 type PerThreadVec<T> = Arc<Vec<Mutex<Vec<T>>>>;
@@ -63,23 +61,38 @@ pub fn get_compression_agnostic_reader<P: AsRef<Path> + Display>(
     Ok(reader)
 }
 
-/// Converts a numerical k-mer index back into the corresponding DNA sequence.
+/// Converts a numerical k-mer index into the corresponding DNA sequence, writing into an existing
+/// buffer instead of allocating.
 ///
 /// Given an index (representing a k-mer encoded as a `usize` where each base takes 2 bits) and the
-/// k-mer length `k`, this function reconstructs the original k-mer sequence as a `Vec<u8>` using
-/// 'A', 'C', 'G', 'T'.
-pub fn index_to_kmer(index: usize, k: usize) -> Vec<u8> {
+/// k-mer length `k`, this function reconstructs the original k-mer sequence as 'A', 'C', 'G', 'T'
+/// in the first `k` bytes of `buf`. The buffer must have length >= k.
+pub fn index_to_kmer_buf(index: usize, k: usize, buf: &mut [u8]) {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut idx = index;
-    let mut kmer = vec![b'N'; k];
-    for item in kmer.iter_mut() {
-        // extract the last two bits
-        *item = bases[idx & 3];
+    for i in (0..k).rev() {
+        buf[i] = bases[idx & 3];
         idx >>= 2;
     }
-    // we still need to reverse to get the correct order
-    kmer.reverse();
-    kmer
+}
+
+/// Computes the index of the reverse complement directly from a k-mer index using bit manipulation.
+///
+/// Instead of converting an index to a k-mer string, computing the reverse complement string, and
+/// converting back, this function operates directly on the 2-bit encoded index. Each base pair is
+/// extracted, complemented (A<->T, C<->G via XOR with 3), and placed in reverse order.
+///
+/// This is equivalent to computing `dna::revcomp` on the k-mer string and converting back to an
+/// index, but avoids all allocations.
+pub fn revcomp_index(index: usize, k: usize) -> usize {
+    let mut rc_idx = 0;
+    let mut idx = index;
+    for _ in 0..k {
+        // extract last 2 bits, complement (XOR with 3), shift into result
+        rc_idx = (rc_idx << 2) | ((idx & 3) ^ 3);
+        idx >>= 2;
+    }
+    rc_idx
 }
 
 /// Converts a DNA k-mer sequence (as bytes) into its numerical index representation.
@@ -227,9 +240,8 @@ impl KmerCounter {
                     let mut first_thread_counts = per_thread_counts[0].lock().unwrap();
                     for thread_count in per_thread_counts.iter().skip(1) {
                         let thread_count = thread_count.lock().unwrap();
-                        for (first, &other) in first_thread_counts
-                            .iter_mut()
-                            .zip(thread_count.iter())
+                        for (first, &other) in
+                            first_thread_counts.iter_mut().zip(thread_count.iter())
                         {
                             *first += other;
                         }
@@ -262,8 +274,10 @@ impl KmerCounter {
     /// - If `canonical` is true, only the lexicographically smaller of a k-mer and its reverse
     ///   complement is reported, with counts summed. Palindromes are reported as is.
     /// - If `write_zeros` is false, k-mers with zero counts are omitted.
+    ///
+    /// Uses [`revcomp_index`] for allocation-free reverse complement lookup and [`index_to_kmer_buf`]
+    /// with [`itoa::Buffer`] to avoid per-k-mer heap allocations in the write loop.
     pub fn write(self, outfile: Option<&String>, canonical: bool, write_zeros: bool) -> Result<()> {
-        // extract `k` from `self`
         let k = match self {
             Self::SingleThreaded { k, .. } => k,
             Self::MultiThreaded { k, .. } => k,
@@ -279,40 +293,44 @@ impl KmerCounter {
         };
 
         let mut out_writer = BufWriter::new(out);
+        let mut kmer_buf = vec![0u8; k];
+        let mut num_buf = itoa::Buffer::new();
 
         if canonical {
             // look up the reverse complement of the kmer and print the smaller of the two
             // (alongside the sum of the counts)
             for (index, &count) in counts.iter().enumerate() {
-                let kmer = index_to_kmer(index, k);
-                // TODO: implement a way to get the index of the reverse complement directly
-                let revcomp = dna::revcomp(&kmer);
-                // only write if this kmer is canonical (i.e. smaller than the reverse complement)
-                if kmer > revcomp {
+                let rc_index = revcomp_index(index, k);
+                // only write if this kmer is canonical (i.e. index <= rc_index)
+                if index > rc_index {
                     continue;
                 }
-                // for a palindromic kmer (identical to the reverse complement), write the counts;
-                // otherwise, write the sum of both counts
-                let combined_count = if kmer == revcomp {
-                    // kmer is palindrome
+                // for a palindromic kmer, write the counts as is; otherwise, write the sum of both
+                // counts
+                let combined_count = if index == rc_index {
                     count
                 } else {
-                    // kmer is smaller than its reverse complement
-                    count + counts[kmer_to_index(&revcomp)]
+                    count + counts[rc_index]
                 };
                 if combined_count == 0 && !write_zeros {
                     continue;
                 }
-                writeln!(out_writer, "{}\t{}", from_utf8(&kmer)?, combined_count)?;
+                index_to_kmer_buf(index, k, &mut kmer_buf);
+                out_writer.write_all(&kmer_buf)?;
+                out_writer.write_all(b"\t")?;
+                out_writer.write_all(num_buf.format(combined_count).as_bytes())?;
+                out_writer.write_all(b"\n")?;
             }
         } else {
-            // also write non-canonical kmers
             for (index, &count) in counts.iter().enumerate() {
                 if count == 0 && !write_zeros {
                     continue;
-                };
-                let kmer = index_to_kmer(index, k);
-                writeln!(out_writer, "{}\t{}", from_utf8(&kmer)?, count)?;
+                }
+                index_to_kmer_buf(index, k, &mut kmer_buf);
+                out_writer.write_all(&kmer_buf)?;
+                out_writer.write_all(b"\t")?;
+                out_writer.write_all(num_buf.format(count).as_bytes())?;
+                out_writer.write_all(b"\n")?;
             }
         }
         Ok(())
@@ -345,7 +363,9 @@ impl std::ops::Add<KmerCounter> for KmerCounter {
                     return Err(anyhow!("Cannot add KmerCounters with different k values"));
                 }
                 if counts.len() != other_counts.len() {
-                    return Err(anyhow!("Cannot add KmerCounters with different count lengths"));
+                    return Err(anyhow!(
+                        "Cannot add KmerCounters with different count lengths"
+                    ));
                 }
                 for (left, &right) in counts.iter_mut().zip(other_counts.iter()) {
                     *left += right;
@@ -605,6 +625,8 @@ impl CountKmers for FastxReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bio::alphabets::dna;
+    use std::str::from_utf8;
 
     // this impl is just used for testing
     impl PerBaseRefRecord for &[u8] {
@@ -627,6 +649,12 @@ mod tests {
         let mut counter = KmerCounter::new(k, 1);
         counter.count(seq).unwrap();
         counter.into_vec().unwrap()
+    }
+
+    fn kmer_from_index(index: usize, k: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; k];
+        index_to_kmer_buf(index, k, &mut buf);
+        buf
     }
 
     #[test]
@@ -666,10 +694,8 @@ mod tests {
     }
 
     #[test]
-    fn test_index_to_kmer() {
+    fn test_index_to_kmer_buf() {
         let k = 3;
-        let kmer = index_to_kmer(0b00_01_10, k);
-        assert_eq!(kmer, b"ACG");
 
         let acg_index = 0b00_01_10; // ACG
         let cgt_index = 0b01_10_11; // CGT
@@ -679,13 +705,13 @@ mod tests {
         let gaa_index = 0b10_00_00; // GAA
         let aaa_index = 0b00_00_00; // AAA
 
-        assert_eq!(index_to_kmer(acg_index, k), b"ACG");
-        assert_eq!(index_to_kmer(cgt_index, k), b"CGT");
-        assert_eq!(index_to_kmer(gta_index, k), b"GTA");
-        assert_eq!(index_to_kmer(tac_index, k), b"TAC");
-        assert_eq!(index_to_kmer(cga_index, k), b"CGA");
-        assert_eq!(index_to_kmer(gaa_index, k), b"GAA");
-        assert_eq!(index_to_kmer(aaa_index, k), b"AAA");
+        assert_eq!(kmer_from_index(acg_index, k), b"ACG");
+        assert_eq!(kmer_from_index(cgt_index, k), b"CGT");
+        assert_eq!(kmer_from_index(gta_index, k), b"GTA");
+        assert_eq!(kmer_from_index(tac_index, k), b"TAC");
+        assert_eq!(kmer_from_index(cga_index, k), b"CGA");
+        assert_eq!(kmer_from_index(gaa_index, k), b"GAA");
+        assert_eq!(kmer_from_index(aaa_index, k), b"AAA");
     }
 
     #[test]
@@ -701,6 +727,63 @@ mod tests {
         assert_eq!(counts.iter().sum::<usize>(), 2);
     }
 
-    // TODO: add tests for the whole program (i.e. against an existing file to make sure the output
-    //   format etc is as expected)
+    #[test]
+    fn test_revcomp_index_basic() {
+        // ACG (index 0b00_01_10 = 6) -> revcomp is CGT (index 0b01_10_11 = 27)
+        assert_eq!(revcomp_index(0b00_01_10, 3), 0b01_10_11);
+        // CGT -> ACG
+        assert_eq!(revcomp_index(0b01_10_11, 3), 0b00_01_10);
+    }
+
+    #[test]
+    fn test_revcomp_index_palindrome() {
+        // For k=2, AT (0b00_11 = 3) -> revcomp AT (0b00_11 = 3)
+        assert_eq!(revcomp_index(0b00_11, 2), 0b00_11);
+        // GC (0b10_01 = 9) -> GC (0b10_01 = 9)
+        assert_eq!(revcomp_index(0b10_01, 2), 0b10_01);
+    }
+
+    #[test]
+    fn test_revcomp_index_single_base() {
+        // A (0) -> T (3)
+        assert_eq!(revcomp_index(0, 1), 3);
+        // C (1) -> G (2)
+        assert_eq!(revcomp_index(1, 1), 2);
+        // G (2) -> C (1)
+        assert_eq!(revcomp_index(2, 1), 1);
+        // T (3) -> A (0)
+        assert_eq!(revcomp_index(3, 1), 0);
+    }
+
+    #[test]
+    fn test_revcomp_index_matches_string_method() {
+        // exhaustively verify that revcomp_index matches the string-based method for all k-mers
+        for k in 1..=6 {
+            let n_kmers = 4usize.pow(k as u32);
+            for idx in 0..n_kmers {
+                let kmer = kmer_from_index(idx, k);
+                let rc_string = dna::revcomp(&kmer);
+                let expected = kmer_to_index(&rc_string);
+                assert_eq!(
+                    revcomp_index(idx, k),
+                    expected,
+                    "mismatch for k={}, idx={}, kmer={}",
+                    k,
+                    idx,
+                    from_utf8(&kmer).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_revcomp_index_involution() {
+        // revcomp(revcomp(x)) == x for all k-mers
+        for k in 1..=5 {
+            let n_kmers = 4usize.pow(k as u32);
+            for idx in 0..n_kmers {
+                assert_eq!(revcomp_index(revcomp_index(idx, k), k), idx);
+            }
+        }
+    }
 }
