@@ -89,11 +89,17 @@ fn chrm_path() -> &'static str {
 }
 
 fn chrun_combined_path() -> &'static str {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chrUn_combined.fa.gz")
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chrUn_combined.fa.gz"
+    )
 }
 
 fn chrun_per_scaffold_dir() -> &'static str {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chrUn-one-seq-per-file")
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/chrUn-one-seq-per-file"
+    )
 }
 
 /// Collect all .fa.gz files in the chrUn per-scaffold directory as owned Strings.
@@ -120,19 +126,28 @@ fn chrun_per_scaffold_files() -> Vec<String> {
 #[test]
 fn test_fna_noncanonical_k3() {
     let output = run_smakcr(&[test_fna_path(), "-k", "3"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_nc_k3_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_nc_k3_kmc.tsv", fixtures_dir()),
+    );
 }
 
 #[test]
 fn test_fna_noncanonical_k5() {
     let output = run_smakcr(&[test_fna_path(), "-k", "5"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_nc_k5_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_nc_k5_kmc.tsv", fixtures_dir()),
+    );
 }
 
 #[test]
 fn test_fna_noncanonical_k7() {
     let output = run_smakcr(&[test_fna_path(), "-k", "7"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_nc_k7_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_nc_k7_kmc.tsv", fixtures_dir()),
+    );
 }
 
 // =====================================================================
@@ -142,19 +157,28 @@ fn test_fna_noncanonical_k7() {
 #[test]
 fn test_fna_canonical_k3() {
     let output = run_smakcr(&[test_fna_path(), "-k", "3", "-c"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_c_k3_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_c_k3_kmc.tsv", fixtures_dir()),
+    );
 }
 
 #[test]
 fn test_fna_canonical_k5() {
     let output = run_smakcr(&[test_fna_path(), "-k", "5", "-c"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_c_k5_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_c_k5_kmc.tsv", fixtures_dir()),
+    );
 }
 
 #[test]
 fn test_fna_canonical_k7() {
     let output = run_smakcr(&[test_fna_path(), "-k", "7", "-c"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_c_k7_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_c_k7_kmc.tsv", fixtures_dir()),
+    );
 }
 
 // =====================================================================
@@ -240,7 +264,10 @@ fn chrun_canonical_k7_multithreaded() {
 #[test]
 fn test_fna_noncanonical_k3_multithreaded() {
     let output = run_smakcr(&[test_fna_path(), "-k", "3", "-t", "4"]);
-    assert_matches_kmc(&output, &format!("{}/test_fna_nc_k3_kmc.tsv", fixtures_dir()));
+    assert_matches_kmc(
+        &output,
+        &format!("{}/test_fna_nc_k3_kmc.tsv", fixtures_dir()),
+    );
 }
 
 // =====================================================================
@@ -301,7 +328,10 @@ fn test_output_to_file() {
 
     run_smakcr(&[test_fna_path(), "-k", "3", "-o", outfile_str]);
 
-    assert!(Path::new(outfile_str).exists(), "Output file was not created");
+    assert!(
+        Path::new(outfile_str).exists(),
+        "Output file was not created"
+    );
     let content = std::fs::read_to_string(outfile_str).unwrap();
     let counts = parse_kmer_counts(&content);
     assert!(!counts.is_empty(), "Output file is empty");
@@ -322,7 +352,12 @@ fn test_zero_counts_flag() {
     let output = run_smakcr(&[test_fna_path(), "-k", "3", "-z"]);
     let counts = parse_kmer_counts(&output);
     // With -z, we should get all 4^3 = 64 k-mers
-    assert_eq!(counts.len(), 64, "Expected 64 k-mers with -z flag, got {}", counts.len());
+    assert_eq!(
+        counts.len(),
+        64,
+        "Expected 64 k-mers with -z flag, got {}",
+        counts.len()
+    );
 }
 
 // =====================================================================
@@ -356,7 +391,10 @@ fn test_single_short_sequence() {
     let output = run_smakcr(&[short_file.to_str().unwrap(), "-k", "3"]);
     let counts = parse_kmer_counts(&output);
     // Sequence "AC" is shorter than k=3, so no k-mers should be counted
-    assert!(counts.is_empty(), "Expected no k-mers for sequence shorter than k");
+    assert!(
+        counts.is_empty(),
+        "Expected no k-mers for sequence shorter than k"
+    );
 
     std::fs::remove_file(&short_file).ok();
 }

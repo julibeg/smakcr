@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use anyhow::Result;
 use clap::{value_parser, Arg, ArgAction, Command};
 
@@ -34,6 +32,20 @@ fn main() -> Result<()> {
                 .help("Number of threads"),
         )
         .arg(
+            Arg::new("CHUNK_SIZE")
+                .long("chunk-size")
+                .default_value("1048576")
+                .value_parser(value_parser!(usize))
+                .help("Chunk size in bytes for parallel counting"),
+        )
+        .arg(
+            Arg::new("QUEUE_MB")
+                .long("queue-mb")
+                .default_value("64")
+                .value_parser(value_parser!(usize))
+                .help("Queue memory limit in MB for parallel counting"),
+        )
+        .arg(
             Arg::new("OUT")
                 .short('o')
                 .long("output")
@@ -55,44 +67,21 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let input_files: Vec<_> = matches.get_many::<String>("FASTA").unwrap().collect();
+    let input_files: Vec<String> = matches
+        .get_many::<String>("FASTA")
+        .unwrap()
+        .cloned()
+        .collect();
     let k: usize = *matches.get_one("SIZE").unwrap();
     let n_threads: usize = *matches.get_one("THREADS").unwrap();
     let output = matches.get_one::<String>("OUT");
     let canonical = matches.get_flag("CANONICAL");
     let write_zeros = matches.get_flag("ZERO");
+    let chunk_size: usize = *matches.get_one("CHUNK_SIZE").unwrap();
+    let queue_mb: usize = *matches.get_one("QUEUE_MB").unwrap();
 
-    let counter = match (input_files.len(), n_threads) {
-        (1, _) | (_, 1) => {
-            // either just one file or just one thread --> process the files sequentially with
-            // `n_threads` threads at a time
-            let mut counter = KmerCounter::new(k, n_threads);
-
-            for &file in input_files.iter() {
-                let reader = smakcr::FastxReader::from_file(file)?;
-                counter.count(reader)?;
-            }
-            counter
-        }
-        (_, _) => {
-            // many files and many threads --> use rayon (this is not very efficient when there are
-            // more threads than files but we'll figure out a better way later)
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(n_threads)
-                .build_global()?;
-
-            input_files
-                .par_iter()
-                .map(|&file| -> Result<KmerCounter> {
-                    let reader = smakcr::FastxReader::from_file(file)?;
-                    let mut counter = KmerCounter::new(k, 1);
-                    counter.count(reader)?;
-                    Ok(counter)
-                })
-                .try_reduce_with(|acc, counter| acc + counter)
-                .ok_or_else(|| anyhow::anyhow!("No input files to process"))??
-        }
-    };
+    let mut counter = KmerCounter::new(k, n_threads);
+    counter.count_paths(&input_files, chunk_size, queue_mb * 1024 * 1024)?;
 
     counter.write(output, canonical, write_zeros)?;
 

@@ -18,7 +18,23 @@ env_logger = "0.11.9"
 measure_time = "0.9.0"
 seq_io = "0.3.4"
 rayon = "1.11.0"
+memchr = "2"
 itoa = "1.0.17"
+
+[dev-dependencies]
+bio = "3.0.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+flate2 = "1"
+seq_io = "0.3"
+needletail = "0.6"
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false
 
 [profile.release]
 lto = true

@@ -1,16 +1,46 @@
 use std::{
+    collections::VecDeque,
     fmt::Display,
     fs::File,
-    io::{stdout, BufRead, BufReader, BufWriter, Read, Write},
+    io::{stdout, BufReader, BufWriter, Read, Write},
     path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
+    thread,
 };
 
-use anyhow::{anyhow, Context, Error, Result};
-use seq_io::{fasta, fastq, parallel};
+use anyhow::{anyhow, Context, Result};
+mod chunker;
+use crate::chunker::{FastxChunker, SEQ_SENTINEL};
+
+/// Re-export for benchmarks. Not part of the public API.
+#[doc(hidden)]
+pub mod chunker_for_bench {
+    pub use crate::chunker::FastxChunker;
+}
+
+#[cfg(test)]
+mod worker_test_hooks {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static WORKER_IDS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+    fn store() -> &'static Mutex<HashSet<usize>> {
+        WORKER_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    pub(super) fn reset_worker_ids() {
+        store().lock().unwrap().clear();
+    }
+
+    pub(super) fn record_worker_id(id: usize) {
+        store().lock().unwrap().insert(id);
+    }
+
+    pub(super) fn worker_id_count() -> usize {
+        store().lock().unwrap().len()
+    }
+}
 
 type PerThreadVec<T> = Arc<Vec<Mutex<Vec<T>>>>;
 
@@ -107,49 +137,6 @@ pub fn kmer_to_index(kmer: &[u8]) -> usize {
     idx
 }
 
-/// An enum abstracting over [seq_io](https://crates.io/crates/seq_io) FASTA and FASTQ readers.
-///
-/// This allows processing files in either format using a common interface.
-pub enum FastxReader {
-    Fasta(fasta::Reader<Box<dyn Read + Send>>),
-    Fastq(fastq::Reader<Box<dyn Read + Send>>),
-}
-
-impl FastxReader {
-    /// Creates a `FastxReader` instance by detecting the format of the input file
-    /// (compression-agnostic).
-    ///
-    /// It reads the first byte of the file ('>' indicates FASTA, '@' indicates FASTQ) and returns
-    /// an error if the file is empty or the format is unrecognized.
-    pub fn from_file<P: AsRef<Path> + Display>(path: P) -> Result<Self> {
-        let reader = get_compression_agnostic_reader(&path)?;
-
-        // wrap the reader in a BufReader and fill it to allow peeking at the first byte.
-        let mut buf_reader = BufReader::new(reader);
-        let buffer = buf_reader
-            .fill_buf()
-            .context("Failed reading first byte from file")?;
-        if buffer.is_empty() {
-            return Err(anyhow::anyhow!("File is empty"));
-        }
-        // Copy the first byte without consuming the buffer.
-        let first_byte = buffer[0];
-
-        let reader = match first_byte {
-            b'>' => FastxReader::Fasta(fasta::Reader::new(Box::new(buf_reader))),
-            b'@' => FastxReader::Fastq(fastq::Reader::new(Box::new(buf_reader))),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Invalid FASTx file format (first byte is '{}' and neither '>' nor '@'",
-                    first_byte as char
-                ));
-            }
-        };
-
-        Ok(reader)
-    }
-}
-
 /// Enum to hold k-mer counts and configuration (variants for single- and multi-threaded).
 ///
 /// This enum manages k-mer counting, supporting both single-threaded and multi-threaded execution
@@ -177,6 +164,7 @@ impl KmerCounter {
     /// If `num_threads` is 1, it creates a `SingleThreaded` counter. Otherwise, it sets up a
     /// `MultiThreaded` counter with thread-local storage for counts.
     pub fn new(k: usize, num_threads: usize) -> Self {
+        assert!(k > 0, "k must be >= 1");
         // define mask to set left-shifted bits to 0 (used below)
         let mask = 4usize.pow(k as u32) - 1;
 
@@ -199,19 +187,38 @@ impl KmerCounter {
         }
     }
 
-    /// Processes the input data to count k-mers.
-    ///
-    /// Dispatches the counting task to either the single-threaded or parallel implementation based
-    /// on the variant of `Self`. The input must implement the `CountKmers` trait.
-    pub fn count<T: CountKmers>(&mut self, input: T) -> Result<()> {
+    /// Counts k-mers from one or more files, using the worker-pool chunking model when threaded.
+    pub fn count_paths(
+        &mut self,
+        paths: &[String],
+        chunk_size: usize,
+        queue_bytes: usize,
+    ) -> Result<()> {
         match self {
-            Self::SingleThreaded { k, counts, mask } => input.count_kmers(*k, counts, *mask)?,
+            Self::SingleThreaded { k, counts, mask } => {
+                for path in paths {
+                    let mut file = build_chunker(path, *k, chunk_size)?;
+                    while let Some(chunk) = file.chunker.next_chunk()? {
+                        count_chunk(*k, counts, *mask, &chunk);
+                    }
+                }
+            }
             Self::MultiThreaded {
                 k,
                 per_thread_counts,
                 mask,
                 n_threads,
-            } => input.count_kmers_parallel(*k, per_thread_counts, *mask, *n_threads)?,
+            } => {
+                count_paths_worker_pool(
+                    paths,
+                    *k,
+                    per_thread_counts,
+                    *mask,
+                    *n_threads,
+                    chunk_size,
+                    queue_bytes,
+                )?;
+            }
         }
         Ok(())
     }
@@ -379,282 +386,330 @@ impl std::ops::Add<KmerCounter> for KmerCounter {
     }
 }
 
-/// A helper trait to provide a common interface for `seq_io::fasta::RefRecord` and
-/// `seq_io::fastq::RefRecord`.
-///
-/// The trait enforces a method for checking if a `RefRecord`'s sequence is long enough to contain a
-/// k-mer and for iteratively process each base with a closure. This avoids code duplication in the
-/// `CountKmers` implementation for the two different record types.
-trait PerBaseRefRecord {
-    /// Checks if the sequence record is potentially too short to contain any k-mers of length `k`.
-    ///
-    /// Implementations should account for the specific structure of the record format (e.g.,
-    /// newlines in FASTA) to provide an accurate check.
-    fn too_short(&self, k: usize) -> bool;
-
-    /// Iterates over each base in the sequence record, applying the provided closure `f`.
-    ///
-    /// This abstracts away the details of how sequence data is stored or accessed within different
-    /// record types (e.g., handling line breaks in FASTA).
-    fn for_each_base<F>(&self, f: F)
-    where
-        F: FnMut(u8);
+struct FileState {
+    chunker: FastxChunker<BufReader<Box<dyn Read + Send>>>,
 }
 
-impl PerBaseRefRecord for fasta::RefRecord<'_> {
-    /// Checks if the FASTQ record is too short to contain a single k-mer.
-    ///
-    /// Considers potential newlines within the sequence data by checking `full_seq()`
-    /// if the raw sequence length `seq().len()` seems borderline.
-    fn too_short(&self, k: usize) -> bool {
-        if <Self as fasta::Record>::seq(self).len() < k * 2 {
-            // the sequence might be too short to contain a k-mer. however, when checking we need to
-            // make sure to take newlines into account (at worst we could be dealing with a FASTA
-            // file with just one base per line and then `full_seq()` would be half the length of
-            // `seq()`). note that we don't check `full_seq().len()` right away because `full_seq()`
-            // allocates a new vector and we want to avoid that unless we have to
-            self.full_seq().len() < k
-        } else {
-            false
+struct FilePoolState {
+    files: VecDeque<FileState>,
+    active_readers: usize,
+    done: bool,
+}
+
+struct FilePool {
+    state: Mutex<FilePoolState>,
+    cv: Condvar,
+}
+
+impl FilePool {
+    fn new(files: Vec<FileState>) -> Self {
+        Self {
+            state: Mutex::new(FilePoolState {
+                files: files.into(),
+                active_readers: 0,
+                done: false,
+            }),
+            cv: Condvar::new(),
         }
     }
 
-    /// Iterates over bases in a FASTA record (ignoring newlines) and applies the provided closure.
-    ///
-    /// We could use `.full_seq()`, but this allocates. Instead, we iterate over the individual
-    /// lines in the FASTA record.
-    fn for_each_base<F>(&self, mut f: F)
-    where
-        F: FnMut(u8),
-    {
-        for line in self.seq_lines() {
-            for &b in line {
-                f(b);
-            }
+    fn acquire(&self) -> Option<FileState> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(file) = state.files.pop_front() {
+            state.active_readers += 1;
+            return Some(file);
+        }
+        if state.active_readers == 0 {
+            state.done = true;
+        }
+        None
+    }
+
+    fn release(&self, file: Option<FileState>) {
+        let mut state = self.state.lock().unwrap();
+        if state.active_readers > 0 {
+            state.active_readers -= 1;
+        }
+        if let Some(file) = file {
+            state.files.push_back(file);
+        }
+        if state.files.is_empty() && state.active_readers == 0 {
+            state.done = true;
+        }
+        self.cv.notify_all();
+    }
+
+    fn is_done(&self) -> bool {
+        self.state.lock().unwrap().done
+    }
+}
+
+struct ChunkQueueState {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+struct ChunkQueue {
+    state: Mutex<ChunkQueueState>,
+    cv: Condvar,
+    capacity_bytes: usize,
+}
+
+impl ChunkQueue {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(ChunkQueueState {
+                queue: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            capacity_bytes,
         }
     }
-}
 
-impl PerBaseRefRecord for fastq::RefRecord<'_> {
-    /// Checks if the FASTA record is too short to contain a single k-mer.
-    ///
-    /// FASTQ sequences are contiguous, so this is a simple length check.
-    fn too_short(&self, k: usize) -> bool {
-        // FASTQ-specific length check
-        <Self as fastq::Record>::seq(self).len() < k
-    }
-
-    /// Iterates over bases in a FASTQ record (we don't need to worry about newlines here).
-    fn for_each_base<F>(&self, mut f: F)
-    where
-        F: FnMut(u8),
-    {
-        for &b in <Self as fastq::Record>::seq(self) {
-            f(b);
-        }
-    }
-}
-
-/// A trait defining the interface for k-mer counting operations.
-///
-/// This trait allows different types (like individual sequence records or entire file readers) to
-/// implement their own k-mer counting logic, supporting both single-threaded and parallel
-/// execution.
-pub trait CountKmers {
-    // NOTE: a simple way of allowing the trait on both mutable (`FastxReader`) and immutable
-    // (`fast{a,q}::RefRecord`) data is to just pass `self` which consumes the object (as we're
-    // doing now). this is fine because we're only passing over the data once anyway, but we might
-    // still want to do something more sophisticated in the future
-
-    /// Counts k-mers within the implementing type using a single thread.
-    ///
-    /// Takes the k-mer length, a mutable slice to store the results, and the mask for rolling index
-    /// calculation. Updates the `counts` slice directly.
-    fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()>;
-
-    /// Counts k-mers within the implementing type using multiple threads.
-    ///
-    /// Takes the k-mer length, a vector of thread-local count vectors, the mask for rolling index
-    /// calculation, and the number of threads. Implementations should distribute the work across
-    /// threads and update the corresponding vectors in `per_thread_counts`.
-    ///
-    /// Provides a default single-threaded implementation that delegates to `count_kmers`. Types
-    /// supporting parallelism should override this.
-    fn count_kmers_parallel(
-        self,
-        k: usize,
-        per_thread_counts: &mut PerThreadVec<usize>,
-        mask: usize,
-        _n_threads: usize,
-    ) -> Result<()>
-    where
-        Self: Sized,
-    {
-        self.count_kmers(k, per_thread_counts[0].lock().unwrap().as_mut(), mask)?;
-
-        Ok(())
-    }
-}
-
-impl<T: PerBaseRefRecord> CountKmers for T {
-    /// Implements single-threaded k-mer counting for types that provide base-level access via the
-    /// `PerBaseRefRecord` trait (`seq_io::fasta::RefRecord` and `seq_io::fastq::RefRecord`).
-    ///
-    /// Iterates through the sequence bases, calculates the rolling k-mer index, and increments the
-    /// corresponding count in the `counts` slice. Handles invalid bases ('N' or others) by skipping
-    /// affected k-mers.
-    fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()> {
-        // first check if the record is too short to contain a single k-mer
-        if self.too_short(k) {
+    fn try_push(&self, chunk: Vec<u8>) -> Result<(), Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
             return Ok(());
         }
-
-        // keep a skip counter to avoid counting k-mers with unknown bases (and the first few
-        // nucleotides that don't form a complete k-mer)
-        let mut skip = k - 1;
-        let mut idx = 0;
-
-        // make use of `for_each_base()` to iterate over all bases in the sequence
-        self.for_each_base(|b| {
-            idx = (idx << 2) & mask;
-            let add = KEY_MAP[b as usize];
-            if add == usize::MAX {
-                // unknown base --> skip this k-mer and the next `k - 1` k-mers
-                skip = k - 1;
-                return;
-            }
-            idx += add;
-            if skip == 0 {
-                // only count the k-mer if not skipping
-                counts[idx] += 1;
-            } else {
-                skip -= 1;
-            }
-        });
-
+        let next_bytes = state.bytes + chunk.len();
+        if next_bytes > self.capacity_bytes {
+            return Err(chunk);
+        }
+        state.bytes = next_bytes;
+        state.queue.push_back(chunk);
+        self.cv.notify_one();
         Ok(())
+    }
+
+    fn try_pop(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        let chunk = state.queue.pop_front()?;
+        state.bytes = state.bytes.saturating_sub(chunk.len());
+        Some(chunk)
+    }
+
+    fn wait_for_chunk(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        while state.queue.is_empty() && !state.closed {
+            state = self.cv.wait(state).unwrap();
+        }
+        let chunk = state.queue.pop_front()?;
+        state.bytes = state.bytes.saturating_sub(chunk.len());
+        Some(chunk)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state.lock().unwrap().queue.is_empty()
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        self.cv.notify_all();
     }
 }
 
-impl CountKmers for FastxReader {
-    /// Implements single-threaded k-mer counting for a `FastxReader`.
-    ///
-    /// Iterates through all records (FASTA or FASTQ) provided by the reader and delegates the
-    /// counting for each record to its own implementation.
-    fn count_kmers(self, k: usize, counts: &mut [usize], mask: usize) -> Result<()> {
-        match self {
-            Self::Fasta(mut reader) => {
-                while let Some(record) = reader.next() {
-                    record?.count_kmers(k, counts, mask)?;
-                }
-            }
-            Self::Fastq(mut reader) => {
-                while let Some(record) = reader.next() {
-                    record?.count_kmers(k, counts, mask)?;
-                }
-            }
-        }
-        Ok(())
+fn build_chunker(path: &str, k: usize, chunk_size: usize) -> Result<FileState> {
+    let reader = get_compression_agnostic_reader(path)?;
+    let buf_reader = BufReader::new(reader);
+    let chunker = FastxChunker::new(buf_reader, k, chunk_size)?;
+    Ok(FileState { chunker })
+}
+
+fn count_chunk(k: usize, counts: &mut [usize], mask: usize, chunk: &[u8]) {
+    count_kmers_bytes(k, counts, mask, chunk, Some(SEQ_SENTINEL));
+}
+
+fn count_kmers_bytes(
+    k: usize,
+    counts: &mut [usize],
+    mask: usize,
+    bytes: &[u8],
+    reset_on: Option<u8>,
+) {
+    if k == 0 || bytes.len() < k {
+        return;
     }
 
-    /// Implements parallel k-mer counting for a `FastxReader`.
-    ///
-    /// Uses `seq_io::parallel::read_parallel` to read records concurrently and distribute the
-    /// counting across multiple threads. Each thread updates its assigned vector within
-    /// `per_thread_counts`.
-    fn count_kmers_parallel(
-        self,
-        k: usize,
-        per_thread_counts: &mut PerThreadVec<usize>,
-        mask: usize,
-        n_threads: usize,
-    ) -> Result<()> {
-        let queue_len = n_threads * 2;
+    let mut skip = k - 1;
+    let mut idx = 0usize;
 
-        // TODO: ideally we'd factor this out into `PerThreadVec` and have a method to get the lock
-        // of one of the vectors
-        let record_set_counter = Arc::new(AtomicUsize::new(0));
+    match reset_on {
+        Some(reset) => {
+            for &b in bytes {
+                if b == reset {
+                    skip = k - 1;
+                    idx = 0;
+                    continue;
+                }
 
-        // the match arms below would only differ by the type of the `record_set` parameter, so we
-        // can use a macro to avoid code duplication
-        macro_rules! parallel_read_parallel_impl {
-            ($reader:expr, $record_set_type:ty) => {
-                parallel::read_parallel(
-                    $reader,
-                    // use `n_threads - 1` because `parallel::read_parallel` also spawns a reader
-                    // thread
-                    n_threads as u32 - 1,
-                    queue_len,
-                    |record_set: &mut $record_set_type| {
-                        // get the thread ID and the corresponding counts vector
-                        let thread_id =
-                            record_set_counter.fetch_add(1, Ordering::SeqCst) % n_threads;
+                idx = (idx << 2) & mask;
+                let add = KEY_MAP[b as usize];
+                if add == usize::MAX {
+                    skip = k - 1;
+                    continue;
+                }
+                idx += add;
 
-                        let mut counts = per_thread_counts[thread_id].lock().unwrap();
-
-                        for record in record_set.into_iter() {
-                            record
-                                .count_kmers(k, &mut counts, mask)
-                                .expect("Error counting bases in `read_parallel`");
-                        }
-                    },
-                    |record_sets| {
-                        // nothing to do in this closure, just error propagation
-                        while let Some(result) = record_sets.next() {
-                            result?;
-                        }
-                        Ok::<(), Error>(())
-                    },
-                )?;
-            };
-        }
-
-        match self {
-            Self::Fasta(reader) => {
-                parallel_read_parallel_impl!(reader, fasta::RecordSet);
-            }
-            Self::Fastq(reader) => {
-                parallel_read_parallel_impl!(reader, fastq::RecordSet);
+                if skip == 0 {
+                    counts[idx] += 1;
+                } else {
+                    skip -= 1;
+                }
             }
         }
+        None => {
+            for &b in bytes {
+                idx = (idx << 2) & mask;
+                let add = KEY_MAP[b as usize];
+                if add == usize::MAX {
+                    skip = k - 1;
+                    continue;
+                }
+                idx += add;
 
-        Ok(())
+                if skip == 0 {
+                    counts[idx] += 1;
+                } else {
+                    skip -= 1;
+                }
+            }
+        }
     }
+}
+
+fn count_paths_worker_pool(
+    paths: &[String],
+    k: usize,
+    per_thread_counts: &mut PerThreadVec<usize>,
+    mask: usize,
+    n_threads: usize,
+    chunk_size: usize,
+    queue_bytes: usize,
+) -> Result<()> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(build_chunker(path, k, chunk_size)?);
+    }
+
+    let file_pool = Arc::new(FilePool::new(files));
+    let queue_capacity = queue_bytes.max(chunk_size * 2).max(1);
+    let chunk_queue = Arc::new(ChunkQueue::new(queue_capacity));
+
+    let mut handles = Vec::with_capacity(n_threads);
+    for thread_id in 0..n_threads {
+        let file_pool = Arc::clone(&file_pool);
+        let chunk_queue = Arc::clone(&chunk_queue);
+        let per_thread_counts = Arc::clone(per_thread_counts);
+
+        let handle = thread::spawn(move || -> Result<()> {
+            let mut counts = per_thread_counts[thread_id].lock().unwrap();
+
+            loop {
+                if let Some(chunk) = chunk_queue.try_pop() {
+                    #[cfg(test)]
+                    {
+                        worker_test_hooks::record_worker_id(thread_id);
+                    }
+                    count_chunk(k, &mut counts, mask, &chunk);
+                    continue;
+                }
+
+                if file_pool.is_done() && chunk_queue.is_empty() {
+                    chunk_queue.close();
+                    break;
+                }
+
+                if let Some(mut file) = file_pool.acquire() {
+                    loop {
+                        match file.chunker.next_chunk()? {
+                            Some(chunk) => {
+                                if let Err(chunk) = chunk_queue.try_push(chunk) {
+                                    // Queue full — count this chunk locally instead of blocking
+                                    #[cfg(test)]
+                                    {
+                                        worker_test_hooks::record_worker_id(thread_id);
+                                    }
+                                    count_chunk(k, &mut counts, mask, &chunk);
+                                    file_pool.release(Some(file));
+                                    break;
+                                }
+                            }
+                            None => {
+                                file_pool.release(None);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if file_pool.is_done() && chunk_queue.is_empty() {
+                    chunk_queue.close();
+                    break;
+                }
+
+                if let Some(chunk) = chunk_queue.wait_for_chunk() {
+                    #[cfg(test)]
+                    {
+                        worker_test_hooks::record_worker_id(thread_id);
+                    }
+                    count_chunk(k, &mut counts, mask, &chunk);
+                    continue;
+                }
+
+                if file_pool.is_done() {
+                    chunk_queue.close();
+                    break;
+                }
+            }
+
+            Ok(())
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("Worker thread panicked"))??;
+    }
+
+    chunk_queue.close();
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bio::alphabets::dna;
+    use std::fs;
     use std::str::from_utf8;
-
-    // this impl is just used for testing
-    impl PerBaseRefRecord for &[u8] {
-        fn too_short(&self, k: usize) -> bool {
-            self.len() < k
-        }
-
-        fn for_each_base<F>(&self, mut f: F)
-        where
-            F: FnMut(u8),
-        {
-            for &b in *self {
-                f(b);
-            }
-        }
-    }
 
     // helper function for tests.
     fn count_kmers_in_sequence(seq: &[u8], k: usize) -> Vec<usize> {
-        let mut counter = KmerCounter::new(k, 1);
-        counter.count(seq).unwrap();
-        counter.into_vec().unwrap()
+        let mask = 4usize.pow(k as u32) - 1;
+        let mut counts = vec![0; 4usize.pow(k as u32)];
+        count_kmers_bytes(k, &mut counts, mask, seq, None);
+        counts
     }
 
     fn kmer_from_index(index: usize, k: usize) -> Vec<u8> {
         let mut buf = vec![0u8; k];
         index_to_kmer_buf(index, k, &mut buf);
         buf
+    }
+
+    fn write_temp_fasta(id: &str, seq: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!("smakcr_worker_test_{}.fa", id));
+        fs::write(&path, format!(">seq\n{}\n", seq)).unwrap();
+        path.to_str().unwrap().to_string()
     }
 
     #[test]
@@ -785,5 +840,38 @@ mod tests {
                 assert_eq!(revcomp_index(revcomp_index(idx, k), k), idx);
             }
         }
+    }
+
+    #[test]
+    fn test_worker_pool_uses_multiple_workers() {
+        let k = 5;
+        let n_threads = 4;
+        let chunk_size = 64;
+        let queue_bytes = 256;
+
+        let seq = "ACGT".repeat(4096);
+        let paths = vec![
+            write_temp_fasta("a", &seq),
+            write_temp_fasta("b", &seq),
+            write_temp_fasta("c", &seq),
+            write_temp_fasta("d", &seq),
+        ];
+
+        worker_test_hooks::reset_worker_ids();
+        let mut counter = KmerCounter::new(k, n_threads);
+        counter
+            .count_paths(&paths, chunk_size, queue_bytes)
+            .unwrap();
+
+        let worker_count = worker_test_hooks::worker_id_count();
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(
+            worker_count >= 2,
+            "expected multiple workers to process chunks, got {}",
+            worker_count
+        );
     }
 }
