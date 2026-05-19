@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let matches = Command::new("smakcr")
         .version(version)
-        .author("Andrea Talenti <andrea.talenti@ed.ac.uk>")
+        .author("Julian Libiseller-Egger <37619875+julibeg@users.noreply.github.com>")
         .about("Print counts of K-mers of a given size across one or more FASTA files")
         .arg(
             Arg::new("FASTA")
